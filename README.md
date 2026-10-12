@@ -24,3 +24,37 @@ A multi-tenant SaaS platform lets enterprise customers manage how their users re
 - Two edits to the same record, both made from the same starting point, should end with one applied and one refused — never both silently merged or lost.
 - A refused request should make clear whether it was refused because the caller was not allowed, or because the record had already changed since it was read.
 - The checks under `tests/` exercise these behaviours once the stack reports it is ready.
+
+## Implementation Notes
+
+The access and concurrency rules live in their own modules, away from the route handlers:
+
+| Module | Responsibility |
+|---|---|
+| `app/authz.py` | Pure authorization decisions: tenant isolation first (every role), then admin-within-tenant, then self-only. Deny by default. |
+| `app/concurrency.py` | ETag derivation and RFC 7232 `If-Match` evaluation (fails closed on malformed tags). |
+| `app/errors.py` | Domain exceptions (`AccessDenied`, `RecordNotFound`, `PreconditionRequired`, `VersionConflict`) and the single place they map to HTTP status codes. |
+| `app/middleware/auth.py` | JWT verification only. All failure modes are 401; malformed claims never leak a 500. |
+| `app/routers/preferences.py` | Thin handlers: authenticate, delegate to the service, attach the ETag. No rules here. |
+
+Concurrency protocol: every response carries `ETag: "<version>"`. A `PUT` must send
+`If-Match` with the ETag it read; the `UPDATE` re-checks the version in its `WHERE`
+clause and bumps it in the same statement, so racing writers cannot both succeed.
+
+Refusals are distinguishable by status and message:
+
+- `401` not authenticated (header/scheme/signature/expiry/claims problem)
+- `403` authenticated, not entitled (wrong tenant, or not owner/admin)
+- `404` no such record
+- `412` record changed since read (lost the race) — re-`GET` and retry
+- `428` update without an `If-Match` precondition
+
+Set `JWT_REQUIRE_EXP=true` in production so tokens without an `exp` claim are rejected.
+
+### Running the checks
+
+```bash
+docker compose up -d --build          # start db + app
+docker compose exec app pytest tests/ -q          # unit/integration suite (21 tests)
+docker compose exec app python scripts/e2e_check.py  # live end-to-end incl. a concurrent-edit race
+```
